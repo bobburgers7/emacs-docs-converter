@@ -20,7 +20,7 @@ import rehypeRemark from 'rehype-remark'
 import remarkStringify from 'remark-stringify'
 import { visit } from 'unist-util-visit'
 
-import { similarity } from './findSimilarity.js'
+//import { similarity } from './findSimilarity.js'
 import { link } from 'fs/promises'
 import { findAndReplace } from 'mdast-util-find-and-replace'
 import replaceHeadings from './replaceHeadings.js'
@@ -190,8 +190,44 @@ const singleFileProcessor = unified()
 
 const dirs = ['org', 'elisp', 'emacs', 'auctex', 'magit']
 
-const bigFileProcessor = (f, dir) =>
-  unified()
+const bigFileProcessor = (f, dir) => {
+  // Build anchor-to-section map for v7 format link resolution
+  const anchorToSection = {}
+  if (f) {
+    // Deep sections (subsubsection, appendixsubsec) get appended to their parent
+    // file rather than written standalone, so links to them should resolve to the parent
+    const deepExtentClasses = ['subsubsection-level-extent', 'appendixsubsec-level-extent']
+
+    const walkForAnchors = (el, parentSectionId) => {
+      const cls = el.properties?.className || []
+      const isSection = cls.some((c) => c.includes('level-extent'))
+      const isDeepSection = cls.some((c) => deepExtentClasses.includes(c))
+      const sectionId = isSection ? el.properties?.id : parentSectionId
+
+      // Map deep section IDs to their parent (they get appended, not standalone)
+      if (isDeepSection && el.properties?.id) {
+        anchorToSection[el.properties.id] = parentSectionId
+      }
+
+      if (el.properties?.id && el.properties.id !== sectionId) {
+        anchorToSection[el.properties.id] = sectionId
+      }
+      if (el.properties?.name) {
+        anchorToSection[el.properties.name] = sectionId
+      }
+
+      for (const child of el.children || []) {
+        if (child.type === 'element') walkForAnchors(child, isDeepSection ? parentSectionId : sectionId)
+      }
+    }
+    visit(f, 'element', (el) => {
+      if (el.properties?.className?.includes('top-level-extent')) {
+        walkForAnchors(el, 'Top')
+      }
+    })
+  }
+
+  return unified()
     .use(rehypeParse, {
       emitParseErrors: true,
       duplicateAttribute: false,
@@ -207,28 +243,17 @@ const bigFileProcessor = (f, dir) =>
           return
         }
 
-        if (link.properties?.href?.includes('FOOT')) return
-        if (link.properties?.href?.includes('https://')) return
+        const href = link.properties.href
+        if (href.includes('FOOT')) return
+        // Skip external links (http, https, mailto, ftp, etc.)
+        if (/^(https?:|mailto:|ftp:)/i.test(href)) return
+        if (href.startsWith('#') === false && /^[a-z]+:/i.test(href)) return
 
-        const cleanerLink = link.properties.href.replaceAll(/.*?#/g, '')
+        const cleanerLink = href.replaceAll(/.*?#/g, '')
 
-        // const comparedNames = (list, name) => {
-        //   const unsorted = list.map((filename) => ({
-        //     filename,
-        //     sim: similarity(filename || '', name || ''),
-        //   }))
-        //   const sorted = unsorted.sort((a, b) => a.sim - b.sim)
-        //   return sorted.reverse()
-        // }
-
-        // const goodLinks = () => {
-        //   if (dirContents[dir].includes(cleanerLink)) return cleanerLink
-
-        //   return comparedNames(dirContents[dir], cleanerLink)?.[0]?.filename
-        // }
-        //const newLink = goodLinks()
-        // link.properties.href = newLink || cleanerLink
-        link.properties.href = `/docs/${dir}/${cleanerLink}`
+        // Resolve anchor IDs to their parent section slug (v7 format)
+        const resolvedLink = anchorToSection[cleanerLink] || cleanerLink
+        link.properties.href = `/docs/${dir}/${resolvedLink}`
       })
     })
     .use(() => (node) =>
@@ -274,20 +299,24 @@ const bigFileProcessor = (f, dir) =>
     // i 'solved" those but it's not ideal, for a second iteration i should just download all the files,
     // who cares if i ddos them a little
     .use(() => (node) => {
+      // Detect format: Texinfo 7.2 uses *-level-extent classes
+      let isV7 = false
+      visit(node, 'element', (el) => {
+        if (el.properties?.className?.some((c) => c.includes('level-extent'))) isV7 = true
+      })
+
+      // Extract footnotes — supports both old (div.footnote) and new (div.footnotes-segment) formats
       let footNotes = {}
       visit(node, 'element', (heading) => {
         if (heading?.tagName !== 'div') return
-        if (!heading?.properties?.className?.includes('footnote')) return
+        const cls = heading?.properties?.className || []
+        if (!cls.includes('footnote') && !cls.includes('footnotes-segment')) return
 
         const footNoteList = heading.children.reduce((acc, curr, index) => {
           if (curr.tagName !== 'h5') return acc
 
           const a = curr.children[0]
-          // const thingy = toString(heading.children[index + 1])
           const thangy = heading.children[index + 2]
-          //toString(heading.children[index + 1]) === '\n'
-          // ?
-          // : thingy
           acc[a.properties.id] = thangy
           return acc
         }, {})
@@ -295,210 +324,269 @@ const bigFileProcessor = (f, dir) =>
         footNotes = footNoteList
       })
 
-      //console.log(footNotes)
-      visit(node, 'element', (bod) => {
-        if (
-          ['auctex', 'magit'].includes(dir)
-            ? bod.tagName !== 'body'
-            : bod.properties?.id !== 'content'
-        )
-          return
-        let isCollecting = false
-        let nodes = []
-        let firstHeader = null
-        let slugId = ''
+      const headingObject = JSON.parse(
+        fs.readFileSync('./headingsToReplace.json', { encoding: 'utf8' })
+      )
 
-        let alreadyDone = []
-        // fs.writeFileSync('bod', JSON.stringify(bod, null, 2))
-        const content = bod.children
+      // Shared: process a section's content nodes into a markdown file
+      const writeSection = ({ contentNodes, slug, title, alreadyDone }) => {
+        if (!title || title === 'empty') return
+        if (alreadyDone.includes(title)) return
+        alreadyDone.push(title)
 
-        const headingObject = JSON.parse(
-          fs.readFileSync('./headingsToReplace.json', { encoding: 'utf8' })
-        )
-        content.forEach((item, index) => {
-          const isHeader =
-            dir !== 'auctex'
-              ? item.tagName === 'div' &&
-                item.properties?.className?.includes('header')
-              : item.tagName === 'table' &&
-                item?.properties?.cellSpacing == '1' &&
-                item?.properties?.cellPadding == '1' &&
-                item?.properties?.border == '0'
+        const newTreeBeforeFootNotes = {
+          type: 'root',
+          children: [
+            {
+              type: 'element',
+              tagName: 'body',
+              children: contentNodes,
+            },
+          ],
+        }
 
-          //<table cellpadding="1" cellspacing="1" border="0">
+        let footNoteCounter = 0
+        let footNoteLinks = []
 
-          if (!isHeader) {
-            if (!slugId) {
-              slugId =
-                content[index - 2]?.properties?.id ||
-                content[index - 5]?.properties?.name
+        visit(newTreeBeforeFootNotes, 'element', (footnote) => {
+          const href = footnote?.properties?.href
+          if (!href) return
+          if (!href.includes('#FOOT')) return
+
+          footNoteLinks.push(href.replaceAll(/#/g, ''))
+          footNoteCounter++
+
+          footnote.label = footNoteCounter
+          footnote.identifier = footNoteCounter
+          footnote.tagName = 'footnoteReference'
+          footnote.children = []
+          footnote.properties = {}
+        })
+
+        const feet = {
+          type: 'element',
+          tagName: 'div',
+          className: 'footnotediv',
+          children: footNoteLinks.map((link, index) => {
+            const textnode = footNotes[link]
+
+            return {
+              type: 'element',
+              tagName: 'footnoteDefinition',
+              children: textnode
+                ? [textnode]
+                : [
+                    {
+                      type: 'element',
+                      tag: 'p',
+                      children: [{ type: 'text', value: 'ERROR' }],
+                    },
+                  ],
+
+              identifier: `${index + 1}`,
+              label: `${index + 1}`,
             }
-            if (
-              ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'].includes(item.tagName) &&
-              !firstHeader
-            ) {
-              firstHeader = item
-              item.tagName = 'h2'
-              const headerTitle = replaceHeadings({
-                heading: toString(item),
-                headingObject,
-              })
-              const pref = getPrefix(headerTitle).prefix
-              if (pref.length === 4) {
-                nodes.push(item)
-              }
-              return
-            }
-            // magit has a lot of empty links, which need to be removed
-            if (item.tagName === 'a' && !item?.properties?.href) return
-            if (item.tagName === 'hr') return
+          }) || [
+            {
+              type: 'element',
+              tag: 'p',
+              children: [{ type: 'text', value: 'ERROR' }],
+            },
+          ],
+        }
 
-            nodes.push(item)
+        const footsies = footNoteLinks?.length
+          ? [...newTreeBeforeFootNotes.children, feet]
+          : [...newTreeBeforeFootNotes.children]
+
+        const newTree = {
+          type: 'root',
+          children: [
+            {
+              type: 'element',
+              tagName: 'body',
+              children: footsies,
+            },
+          ],
+        }
+
+        let cleanTitle = title.replaceAll(/\?/g, '')
+        cleanTitle = cleanTitle.replaceAll(/\//g, ' and ')
+        cleanTitle = cleanTitle.replaceAll(/\%/g, 'precentage')
+        cleanTitle = cleanTitle.replaceAll(/Appendix /g, '')
+        cleanTitle = cleanTitle.replaceAll(/\. /g, ' ')
+        const { prefix, title: formattedTitle } = getPrefix(cleanTitle)
+        const titles = formattedTitle || cleanTitle
+
+        rehypeProcessor.run(newTree).then((f) => {
+          const rawFile = rehypeProcessor.stringify(f)
+          const formattedTitleWithDashes = titles?.replaceAll(/ /g, '-')
+          const fileWithMetadata = `---\nslug: ${
+            slug || formattedTitleWithDashes
+          }\n---\n\n${String(rawFile)}`
+
+          if (prefix.length > 3) {
+            const directory = fs.readdirSync(dir)
+            const ogFile = directory.find((file) => {
+              const filePrefix = getPrefix(file).prefix
+              return (
+                filePrefix[0] === prefix[0] &&
+                filePrefix[1] === prefix[1] &&
+                filePrefix[2] === prefix[2]
+              )
+            })
+            ogFile && fs.appendFileSync(`${dir}/${ogFile}`, rawFile)
             return
           }
 
-          const newTreeBeforeFootNotes = {
-            type: 'root',
-            children: [
-              {
-                type: 'element',
-                tagName: 'body',
-                children: nodes,
-              },
-            ],
+          fs.writeFileSync(`${dir}/${cleanTitle}.md`, fileWithMetadata)
+        })
+      }
+
+      if (isV7) {
+        // Texinfo 7.2: strip a.copiable-link elements (contain ¶ pilcrow marks)
+        visit(node, 'element', (el, index, parent) => {
+          if (
+            el.tagName === 'a' &&
+            el.properties?.className?.includes('copiable-link') &&
+            parent?.children
+          ) {
+            parent.children.splice(parent.children.indexOf(el), 1)
           }
+        })
 
-          let footNoteCounter = 0
-          let footNoteLinks = []
+        // Texinfo 7.2: walk nested *-level-extent divs
+        const alreadyDone = []
+        const isLevelExtent = (el) =>
+          el.type === 'element' &&
+          el.tagName === 'div' &&
+          el.properties?.className?.some((c) => c.includes('level-extent'))
 
-          visit(newTreeBeforeFootNotes, 'element', (footnote) => {
-            const href = footnote?.properties?.href
-            if (!href) return
-            if (!href.includes('#FOOT')) return
+        const processSection = (sectionDiv) => {
+          const slug = sectionDiv.properties?.id || ''
+          const children = sectionDiv.children.filter((c) => c.type === 'element')
 
-            footNoteLinks.push(href.replaceAll(/#/g, ''))
-            footNoteCounter++
+          // Find the heading (first h1-h6 in direct children)
+          const headingEl = children.find((c) =>
+            ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'].includes(c.tagName)
+          )
 
-            // footnote.properties.href = `#f${footNoteCounter}`
-            // footnote.properties.id = `l$${footNoteCounter}`
-            footnote.label = footNoteCounter
-            footnote.identifier = footNoteCounter
-            footnote.tagName = 'footnoteReference'
-            footnote.children = []
-            footnote.properties = {}
+          // Collect content nodes: everything that is not a nav-panel, sub-level-extent, hr, mini-toc, or index anchor
+          const contentNodes = sectionDiv.children.filter((c) => {
+            if (c.type !== 'element') return false
+            if (c.properties?.className?.includes('nav-panel')) return false
+            if (isLevelExtent(c)) return false
+            if (c.tagName === 'hr') return false
+            if (c.properties?.className?.includes('mini-toc')) return false
+            // Keep index anchors (a.index-entry-id) as they're harmless
+            return true
           })
 
-          const feet = {
-            type: 'element',
-            tagName: 'div',
-            className: 'footnotediv',
-            children: footNoteLinks.map((link, index) => {
-              const textnode = footNotes[link]
-
-              return {
-                type: 'element',
-                tagName: 'footnoteDefinition',
-                children: textnode
-                  ? [textnode]
-                  : [
-                      {
-                        type: 'element',
-                        tag: 'p',
-                        children: [{ type: 'text', value: 'ERROR' }],
-                      },
-                    ],
-
-                identifier: `${index + 1}`,
-                label: `${index + 1}`,
-                // properties: { id: `f${index}` },
-              }
-            }) || [
-              {
-                type: 'element',
-                tag: 'p',
-                children: [{ type: 'text', value: 'ERROR' }],
-              },
-            ],
+          if (headingEl) {
+            headingEl.tagName = 'h2'
           }
 
-          const footsies = footNoteLinks?.length
-            ? [...newTreeBeforeFootNotes.children, feet]
-            : [...newTreeBeforeFootNotes.children]
-
-          const newTree = {
-            type: 'root',
-            children: [
-              {
-                type: 'element',
-                tagName: 'body',
-                children: footsies,
-              },
-            ],
-          }
-
-          footNoteLinks.length &&
-            fs.writeFileSync('./footrefs', JSON.stringify(newTree, null, 2))
-          footNoteLinks.length &&
-            fs.writeFileSync('./feet', JSON.stringify(feet, null, 2))
-          const title = firstHeader
-            ? replaceHeadings({
-                heading: toString(firstHeader),
-                headingObject,
-              })
+          const headingText = headingEl
+            ? replaceHeadings({ heading: toString(headingEl), headingObject })
             : 'empty'
-          isCollecting = false
 
-          if (!firstHeader) return
+          writeSection({
+            contentNodes,
+            slug,
+            title: headingText,
+            alreadyDone,
+          })
 
-          //slugId = content[index - 1]?.properties?.id
+          // Recurse into sub-level-extent children
+          children.filter(isLevelExtent).forEach(processSection)
+        }
 
-          //paste footnotes at the bottom of the files
+        // Find the top-level-extent container and process its chapter-level children
+        visit(node, 'element', (el) => {
+          if (!el.properties?.className?.includes('top-level-extent')) return
+          el.children
+            .filter((c) => c.type === 'element' && isLevelExtent(c))
+            .forEach(processSection)
+        })
+      } else {
+        // Texinfo 6.x: original flat div.header delimiter logic
+        visit(node, 'element', (bod) => {
+          if (
+            ['auctex', 'magit'].includes(dir)
+              ? bod.tagName !== 'body'
+              : bod.properties?.id !== 'content'
+          )
+            return
+          let nodes = []
+          let firstHeader = null
+          let slugId = ''
 
-          nodes = []
-          firstHeader = null
+          let alreadyDone = []
+          const content = bod.children
 
-          if (title === 'empty') return
+          content.forEach((item, index) => {
+            const isHeader =
+              dir !== 'auctex'
+                ? item.tagName === 'div' &&
+                  item.properties?.className?.includes('header')
+                : item.tagName === 'table' &&
+                  item?.properties?.cellSpacing == '1' &&
+                  item?.properties?.cellPadding == '1' &&
+                  item?.properties?.border == '0'
 
-          if (alreadyDone.includes(title)) return
-          alreadyDone.push(title)
+            if (!isHeader) {
+              if (!slugId) {
+                slugId =
+                  content[index - 2]?.properties?.id ||
+                  content[index - 5]?.properties?.name
+              }
+              if (
+                ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'].includes(item.tagName) &&
+                !firstHeader
+              ) {
+                firstHeader = item
+                item.tagName = 'h2'
+                const headerTitle = replaceHeadings({
+                  heading: toString(item),
+                  headingObject,
+                })
+                const pref = getPrefix(headerTitle).prefix
+                if (pref.length === 4) {
+                  nodes.push(item)
+                }
+                return
+              }
+              if (item.tagName === 'a' && !item?.properties?.href) return
+              if (item.tagName === 'hr') return
 
-          let cleanTitle = title.replaceAll(/\?/g, '')
-          cleanTitle = cleanTitle.replaceAll(/\//g, ' and ')
-          cleanTitle = cleanTitle.replaceAll(/\%/g, 'precentage')
-          cleanTitle = cleanTitle.replaceAll(/Appendix /g, '')
-          cleanTitle = cleanTitle.replaceAll(/\. /g, ' ')
-          const { prefix, title: formattedTitle } = getPrefix(cleanTitle)
-          const titles = formattedTitle || cleanTitle
-
-          let newSlug = slugId
-          slugId = ''
-
-          rehypeProcessor.run(newTree).then((f) => {
-            const rawFile = rehypeProcessor.stringify(f)
-            const formattedTitleWithDashes = titles?.replaceAll(/ /g, '-')
-            const fileWithMetadata = `---\nslug: ${
-              newSlug || formattedTitleWithDashes
-            }\n---\n\n${String(rawFile)}`
-
-            if (prefix.length > 3) {
-              const directory = fs.readdirSync(dir)
-              const ogFile = directory.find((file) => {
-                const filePrefix = getPrefix(file).prefix
-                return (
-                  filePrefix[0] === prefix[0] &&
-                  filePrefix[1] === prefix[1] &&
-                  filePrefix[2] === prefix[2]
-                )
-              })
-              ogFile && fs.appendFileSync(`${dir}/${ogFile}`, rawFile)
+              nodes.push(item)
               return
             }
 
-            fs.writeFileSync(`${dir}/${cleanTitle}.md`, fileWithMetadata)
+            const title = firstHeader
+              ? replaceHeadings({
+                  heading: toString(firstHeader),
+                  headingObject,
+                })
+              : 'empty'
+
+            if (!firstHeader) return
+
+            writeSection({
+              contentNodes: nodes,
+              slug: slugId,
+              title,
+              alreadyDone,
+            })
+
+            nodes = []
+            firstHeader = null
+            slugId = ''
           })
         })
-      })
+      }
     })
+}
 
 const convertHtmlToMd = ({ file, filepath }) => {
   const tree = bigFileProcessor().parse(file)
@@ -537,9 +625,9 @@ const parseLoop = (dir, filepath = null) => {
   convertHtmlToMd({ file, filepath: path.join(dir, filepath) })
 }
 function main() {
-  const dir = `../raw_manuals/emacs-index`
-
-  parseLoop(dir)
+  const filepath = process.argv[2] || '../raw_manuals/org.html'
+  const file = fs.readFileSync(filepath, { encoding: 'utf8' })
+  convertHtmlToMd({ file, filepath })
 }
 
 main()
