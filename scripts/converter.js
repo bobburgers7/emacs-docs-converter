@@ -471,14 +471,13 @@ const bigFileProcessor = (f, dir) => {
             ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'].includes(c.tagName)
           )
 
-          // Collect content nodes: everything that is not a nav-panel, sub-level-extent, hr, mini-toc, or index anchor
+          // Collect content nodes: everything that is not a nav-panel, sub-level-extent, hr, or heading
           const contentNodes = sectionDiv.children.filter((c) => {
             if (c.type !== 'element') return false
+            if (c === headingEl) return false
             if (c.properties?.className?.includes('nav-panel')) return false
             if (isLevelExtent(c)) return false
             if (c.tagName === 'hr') return false
-            if (c.properties?.className?.includes('mini-toc')) return false
-            // Keep index anchors (a.index-entry-id) as they're harmless
             return true
           })
 
@@ -506,17 +505,25 @@ const bigFileProcessor = (f, dir) => {
           if (!el.properties?.className?.includes('top-level-extent')) return
 
           // Extract top-level content (title, version, copyright) as the manual's root page
+          const topHeading = el.children.find((c) =>
+            c.type === 'element' && ['h1', 'h2', 'h3'].includes(c.tagName)
+          )
           const topContentNodes = el.children.filter((c) => {
             if (c.type !== 'element') return false
+            if (c === topHeading) return false
             if (isLevelExtent(c)) return false
             if (c.properties?.className?.includes('nav-panel')) return false
-            if (c.properties?.className?.includes('region-contents')) return false
+            // Include region-contents (TOC) but strip its heading
+            if (c.properties?.className?.includes('region-contents')) {
+              visit(c, 'element', (tocEl, idx, parent) => {
+                if (tocEl.properties?.className?.includes('contents-heading') && parent) {
+                  parent.children.splice(idx, 1)
+                }
+              })
+            }
             if (c.tagName === 'hr') return false
             return true
           })
-          const topHeading = topContentNodes.find((c) =>
-            ['h1', 'h2', 'h3'].includes(c.tagName)
-          )
           if (topHeading) {
             const topTitle = toString(topHeading)
             writeSection({
