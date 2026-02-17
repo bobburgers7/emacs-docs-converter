@@ -501,9 +501,33 @@ const bigFileProcessor = (f, dir) => {
           children.filter(isLevelExtent).forEach(processSection)
         }
 
-        // Find the top-level-extent container and process its chapter-level children
+        // Find the top-level-extent container
         visit(node, 'element', (el) => {
           if (!el.properties?.className?.includes('top-level-extent')) return
+
+          // Extract top-level content (title, version, copyright) as the manual's root page
+          const topContentNodes = el.children.filter((c) => {
+            if (c.type !== 'element') return false
+            if (isLevelExtent(c)) return false
+            if (c.properties?.className?.includes('nav-panel')) return false
+            if (c.properties?.className?.includes('region-contents')) return false
+            if (c.tagName === 'hr') return false
+            return true
+          })
+          const topHeading = topContentNodes.find((c) =>
+            ['h1', 'h2', 'h3'].includes(c.tagName)
+          )
+          if (topHeading) {
+            const topTitle = toString(topHeading)
+            writeSection({
+              contentNodes: topContentNodes,
+              slug: 'Top',
+              title: topTitle,
+              alreadyDone,
+            })
+          }
+
+          // Process chapter-level children
           el.children
             .filter((c) => c.type === 'element' && isLevelExtent(c))
             .forEach(processSection)
